@@ -1,5 +1,7 @@
 import express from 'express';
 import { ArbitrageBot } from './arbitrage-bot';
+import { Response } from 'express';
+import path from 'path';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -26,6 +28,65 @@ app.get('/health', (req, res) => {
       uptime: process.uptime(),
     }
   });
+});
+
+app.get('/trades', (req, res) => {
+  const tradeHistory = bot.getTradeHistory();
+  res.json(tradeHistory.to_json({ orient: 'records' }));
+});
+
+app.get('/trade-stats', (req, res) => {
+  const stats = bot.getTradeStats();
+  res.json(stats);
+});
+
+// Add new endpoint for CSV export
+app.get('/export-trades', (req, res: Response) => {
+  try {
+    const tradeHistory = bot.getTradeHistory();
+    
+    // Set headers for CSV download
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename=trade_history.csv');
+    
+    // Convert DataFrame to CSV and send
+    tradeHistory.to_csv(res, {
+      index: false,
+      header: true
+    });
+    
+  } catch (error) {
+    console.error('Error exporting trades:', error);
+    res.status(500).json({ error: 'Failed to export trades' });
+  }
+});
+
+// Optional: Add endpoint to get trades within a date range
+app.get('/export-trades/:startDate/:endDate', (req, res: Response) => {
+  try {
+    const { startDate, endDate } = req.params;
+    const tradeHistory = bot.getTradeHistory();
+    
+    // Filter trades by date range
+    const filteredTrades = tradeHistory[
+      (tradeHistory['timestamp'] >= startDate) & 
+      (tradeHistory['timestamp'] <= endDate)
+    ];
+    
+    // Set headers for CSV download
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename=trade_history.csv');
+    
+    // Convert filtered DataFrame to CSV and send
+    filteredTrades.to_csv(res, {
+      index: false,
+      header: true
+    });
+    
+  } catch (error) {
+    console.error('Error exporting trades:', error);
+    res.status(500).json({ error: 'Failed to export trades' });
+  }
 });
 
 // Start the arbitrage bot

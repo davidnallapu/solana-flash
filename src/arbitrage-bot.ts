@@ -5,6 +5,8 @@ import { RaydiumApi } from '@raydium-io/raydium-sdk';
 import { Token, TOKEN_PROGRAM_ID } from '@solana/spl-token';
 import { BN } from 'bn.js';
 import * as dotenv from 'dotenv';
+import pandas as pd;
+import fs from 'fs';
 
 dotenv.config();
 
@@ -21,6 +23,20 @@ interface TradingPair {
   maxSlippage: number;
 }
 
+interface TradeLog {
+  timestamp: string;
+  successful: boolean;
+  tokenPair: string;
+  principal: number;
+  interest?: number;
+  gasFee?: number;
+  slippage?: number;
+  profitLoss?: number;
+  jupiterPrice?: number;
+  raydiumPrice?: number;
+  errorMessage?: string;
+}
+
 class ArbitrageBot {
   private connection: Connection;
   private wallet: Keypair;
@@ -30,6 +46,8 @@ class ArbitrageBot {
   private readonly RATE_LIMIT_MS = 1000; // 1 second between trades
   private readonly MAX_RETRIES = 3;
   private readonly TRANSACTION_FEE = 0.000005; // SOL (5000 lamports)
+  private tradeHistory: TradeLog[] = [];
+  private readonly LOG_FILE = 'trade_history.csv';
   
   // Trading configuration
   private readonly TRADING_PAIRS: TradingPair[] = [
@@ -151,12 +169,29 @@ class ArbitrageBot {
     }
   }
 
+  private async logTrade(trade: TradeLog) {
+    this.tradeHistory.push(trade);
+    
+    // Convert to pandas DataFrame and save to CSV
+    const df = pd.DataFrame(this.tradeHistory);
+    df.to_csv(this.LOG_FILE, index=false);
+  }
+
   private async executeArbitrage(
     pair: TradingPair,
     jupiterPrice: number,
     raydiumPrice: number,
     amount: number
   ) {
+    const tradeLog: TradeLog = {
+      timestamp: new Date().toISOString(),
+      successful: false,
+      tokenPair: `${pair.tokenA.mint}/${pair.tokenB.mint}`,
+      principal: amount,
+      jupiterPrice,
+      raydiumPrice,
+    };
+
     try {
       if (!await this.getRateLimit()) {
         console.log('Rate limit reached, skipping trade');
@@ -164,12 +199,15 @@ class ArbitrageBot {
       }
 
       // Calculate potential profit including fees
-      const estimatedGasCost = this.TRANSACTION_FEE * 2; // Two transactions
+      const estimatedGasCost = this.TRANSACTION_FEE * 2;
+      tradeLog.gasFee = estimatedGasCost;
+
       const potentialProfit = Math.abs(jupiterPrice - raydiumPrice) * amount;
       const netProfit = potentialProfit - estimatedGasCost;
 
       if (netProfit <= 0) {
-        console.log('No profit after fees, skipping trade');
+        tradeLog.errorMessage = 'No profit after fees';
+        await this.logTrade(tradeLog);
         return;
       }
 
@@ -179,26 +217,26 @@ class ArbitrageBot {
         flashLoanAmount,
         pair.tokenA.mint,
         {
-          maxBorrowRateBps: 5000, // 50% max borrow rate
+          maxBorrowRateBps: 5000,
         }
       );
+
+      tradeLog.interest = flashLoan.getInterest().toNumber();
 
       // Execute trades with retry mechanism
       let success = false;
       for (let i = 0; i < this.MAX_RETRIES && !success; i++) {
         try {
           if (jupiterPrice < raydiumPrice) {
-            // Buy on Jupiter, sell on Raydium
             await this.executeJupiterTrade(pair, amount, true);
             await this.executeRaydiumTrade(pair, amount, false);
           } else {
-            // Buy on Raydium, sell on Jupiter
             await this.executeRaydiumTrade(pair, amount, true);
             await this.executeJupiterTrade(pair, amount, false);
           }
           success = true;
         } catch (error) {
-          console.error(`Trade attempt ${i + 1} failed:`, error);
+          tradeLog.errorMessage = `Trade attempt ${i + 1} failed: ${error.message}`;
           if (i === this.MAX_RETRIES - 1) throw error;
         }
       }
@@ -206,10 +244,16 @@ class ArbitrageBot {
       // Repay flash loan
       await flashLoan.repay();
 
+      tradeLog.successful = true;
+      tradeLog.profitLoss = netProfit;
       console.log(`Arbitrage executed successfully! Net profit: ${netProfit} SOL`);
+
     } catch (error) {
+      tradeLog.successful = false;
+      tradeLog.errorMessage = error.message;
       console.error('Error executing arbitrage:', error);
-      throw error;
+    } finally {
+      await this.logTrade(tradeLog);
     }
   }
 
@@ -253,6 +297,24 @@ class ArbitrageBot {
         console.error(`Error checking arbitrage for pair ${pair.tokenA.mint}/${pair.tokenB.mint}:`, error);
       }
     }
+  }
+
+  // Add method to get trade history
+  public getTradeHistory(): pd.DataFrame {
+    return pd.DataFrame(this.tradeHistory);
+  }
+
+  // Add method to get trade statistics
+  public getTradeStats() {
+    const df = this.getTradeHistory();
+    return {
+      totalTrades: df.shape[0],
+      successfulTrades: df[df['successful'] === true].shape[0],
+      totalProfit: df['profitLoss'].sum(),
+      averageProfit: df[df['successful'] === true]['profitLoss'].mean(),
+      totalGasFees: df['gasFee'].sum(),
+      totalInterest: df['interest'].sum(),
+    };
   }
 }
 
